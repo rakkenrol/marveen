@@ -46,6 +46,7 @@ import {
   clearPendingTaskRetryOwnerAlert,
   markScheduledTaskKanbanWaiting,
   createAgentMessage,
+  type PendingTaskRetryRow,
 } from '../db.js'
 import { toPendingRetryView, classifySendError, OWNER_ESCALATION_EXTRA_MS, type PendingRetryView } from '../pending-retries.js'
 import {
@@ -1602,7 +1603,18 @@ async function attemptFireTask(
     if (await clearFeedbackModalAndRecheck(session, host)) {
       logger.info({ task: task.name, agent: agentName, session }, 'Feedback-draft modal cleared, session is ready -- proceeding')
     } else {
-      logger.warn({ task: task.name, agent: agentName, session }, 'Schedule target session busy or has pending input, will retry')
+      // SCHEDBLOCKED1024: name the state that refused. The line used to say
+      // "busy or has pending input" and carry neither, so a 27.5-minute
+      // deferral (2026-10-24, peet) left no way to tell afterwards WHICH
+      // branch held the session: 'busy' (a real turn, or a spinner on a pane
+      // nobody is driving), 'typing' (parked input -- the janitor below owns
+      // that one and logs when it clears), 'unknown' (no recognised footer,
+      // the shape COMMATAIL1022 fixed upstream) or 'error'. The capture is
+      // already in hand for the first-run gate, so this costs no extra tmux
+      // I/O, and the state name is the whole difference between one grep and
+      // an unanswerable question.
+      const paneState = notReadyPane != null ? detectPaneState(notReadyPane) : null
+      logger.warn({ task: task.name, agent: agentName, session, paneState }, 'Schedule target session busy or has pending input, will retry')
       return 'busy'
     }
   }
@@ -2426,6 +2438,48 @@ function runStatusOf(entry: Pick<TaskInflightEntry, 'runId'>): string | null {
   try { return getTaskRunStatus(entry.runId) } catch { return null }
 }
 
+// SCHEDBLOCKED1024: the busy-pane notice says what it measures (SCHEDSORZAR923
+// above) but not what the busy pane COSTS, and that is the one number that
+// decides the triage. Measured 2026-10-24 on peet: the reggeli-napindito round
+// finished its work at 07:32:28 (own daily-log entry, 9 tool calls, 128 s) and
+// the agent then made ZERO tool calls for 55 minutes, yet the pane read
+// not-ready the whole time -- so the 08:00 kanban-audit round was deferred 109
+// times, from 08:00:13 to 08:27:11, and fired only at 08:27:28, 27.5 minutes
+// late. The reader of the notice checked the agent (healthy, 110k context, next
+// round running) and would have closed it as noise; the deferred round was
+// visible only by grepping dashboard.log, because `pending_task_retries` is
+// emptied on delivery and keeps no history.
+// So the notice carries the deferred rounds waiting on the SAME session. This
+// is not a second opinion about the pane: it is the consequence, and it
+// separates "the agent moved on to other work" (harmless) from "a wedge is
+// holding up the queue" (not harmless) without the reader having to dig.
+// Pure, rows passed in, so the text is pinned without DB or tmux I/O.
+export function describeBlockedBehindPane(
+  rows: Array<Pick<PendingTaskRetryRow, 'task_name' | 'agent_name' | 'first_attempt' | 'attempt_count'>>,
+  agentName: string,
+  nowMs: number,
+  selfTaskName?: string,
+): string {
+  const mine = rows.filter(r => r.agent_name === agentName && r.task_name !== selfTaskName)
+  if (mine.length === 0) return ''
+  const oldest = mine.reduce((a, b) => (a.first_attempt <= b.first_attempt ? a : b))
+  const waitingMinutes = Math.floor(Math.max(0, nowMs - oldest.first_attempt) / 60000)
+  return `Közben ugyanerre a sessionre ${mine.length} ütemezett kör vár kézbesítésre` +
+    ` (a legrégebbi: "${oldest.task_name}", ${waitingMinutes} perce, ${oldest.attempt_count} próbálkozás).` +
+    ' Ha a pane foglaltsága hamis, ez a valódi költsége.'
+}
+
+// Impure wrapper: one SELECT, and bookkeeping must never throw into the sweep.
+function blockedBehindLine(entry: Pick<TaskInflightEntry, 'taskName' | 'agentName'>, nowMs: number): string[] {
+  try {
+    const line = describeBlockedBehindPane(listPendingTaskRetries(), entry.agentName, nowMs, entry.taskName)
+    return line ? [line] : []
+  } catch (err) {
+    logger.warn({ err, task: entry.taskName, agent: entry.agentName }, 'blocked-behind line skipped (pending-retry read failed)')
+    return []
+  }
+}
+
 function sendTaskInflightMainAgentNotice(entry: TaskInflightEntry, elapsedMs: number): void {
   const ageMinutes = Math.floor(elapsedMs / 60000)
 
@@ -2437,6 +2491,7 @@ function sendTaskInflightMainAgentNotice(entry: TaskInflightEntry, elapsedMs: nu
   const thresholdMinutes = Math.round(entry.timeoutMs / 60000)
   const text = [
     `[scheduler] ${describeInflightPaneAge(entry, elapsedMs, runStatusOf(entry))} Küszöb: ${thresholdMinutes} perc pane-foglaltság.`,
+    ...blockedBehindLine(entry, Date.now()),
     'Ha a pane jogosan foglalt ennél tovább (hosszú feladat, vagy az ágens mással dolgozik), allitsd a task-config.json "stuckAfterMinutes" mezojet.',
     'Ellenőrizd az ágenst; ha nem oldódik meg, az uzemeltető direkt ertesitest kap ha ez tovabb tart.',
   ].join('\n')
@@ -2526,6 +2581,7 @@ function sendTaskTimeoutAlert(entry: TaskInflightEntry, elapsedMs: number): void
   const text = [
     `[${BOT_NAME} scheduler] ${describeInflightPaneAge(entry, elapsedMs, runStatusOf(entry))} A(z) fő-agent mar ertesitve volt errol, de a pane azota is foglalt.`,
     ...(typical ? [`Ez a feladat általában ${typical} alatt lefut (a korábbi befejezett futások mediánja; ez is PANE-IDŐ: az injektálástól a pane első tétlen állapotáig, nem munkaidő).`] : []),
+    ...blockedBehindLine(entry, Date.now()),
     `A riasztási küszöb ennél a feladatnál ${thresholdMinutes} perc; ha ez a feladat jogosan fut ennél tovább, allitsd a task-config.json "stuckAfterMinutes" mezojet.`,
     'Az ágensben megtekintheted; a dashboard /Ütemezések oldalán visszavonható ha kell.',
   ].join('\n')
